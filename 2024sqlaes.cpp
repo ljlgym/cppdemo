@@ -15,6 +15,7 @@
 #include <cassert>
 #include <fstream>
 #include <chrono>
+#include <random>
 
 using namespace std;
 mutex logger_mutex; // 用于保护 Logger 的访问
@@ -102,7 +103,10 @@ public:
         unsigned char iv[EVP_MAX_IV_LENGTH] = { 0 };
         unsigned char key[EVP_MAX_KEY_LENGTH];
         copy(this->key.begin(), this->key.end(), key);
-        unsigned char ciphertext[1024] = { 0 };
+
+        std::vector<unsigned char> ciphertext(1000 * 1024);
+
+
         int len;
         int ciphertext_len;
 
@@ -117,14 +121,14 @@ public:
             return "";
         }
 
-        if (1 != EVP_EncryptUpdate(ctx, ciphertext, &len, reinterpret_cast<const unsigned char*>(plaintext.c_str()), plaintext.length())) {
+        if (1 != EVP_EncryptUpdate(ctx, ciphertext.data(), &len, reinterpret_cast<const unsigned char*>(plaintext.c_str()), plaintext.length())) {
             cerr << "加密操作时出错" << endl;
             EVP_CIPHER_CTX_free(ctx);
             return "";
         }
         ciphertext_len = len;
 
-        if (1 != EVP_EncryptFinal_ex(ctx, ciphertext + len, &len)) {
+        if (1 != EVP_EncryptFinal_ex(ctx, ciphertext.data() + len, &len)) {
             cerr << "结束加密操作时出错" << endl;
             EVP_CIPHER_CTX_free(ctx);
             return "";
@@ -132,7 +136,7 @@ public:
         ciphertext_len += len;
 
         EVP_CIPHER_CTX_free(ctx);
-        return base64_encode(string(reinterpret_cast<char*>(ciphertext), ciphertext_len));
+        return base64_encode(string(reinterpret_cast<char*>(ciphertext.data()), ciphertext_len));
     }
 
     std::string decrypt(const std::string& ciphertext) {
@@ -141,7 +145,12 @@ public:
         unsigned char key[EVP_MAX_KEY_LENGTH];
         copy(this->key.begin(), this->key.end(), key);
         string decoded_ciphertext = base64_decode(ciphertext);
-        unsigned char plaintext[1024] = { 0 };
+
+
+        std::vector<unsigned char> plaintext(1000 * 1024);
+
+
+
         int len;
         int plaintext_len;
 
@@ -156,14 +165,14 @@ public:
             return "";
         }
 
-        if (1 != EVP_DecryptUpdate(ctx, plaintext, &len, reinterpret_cast<const unsigned char*>(decoded_ciphertext.c_str()), decoded_ciphertext.length())) {
+        if (1 != EVP_DecryptUpdate(ctx, plaintext.data(), &len, reinterpret_cast<const unsigned char*>(decoded_ciphertext.c_str()), decoded_ciphertext.length())) {
             cerr << "解密操作时出错" << endl;
             EVP_CIPHER_CTX_free(ctx);
             return "";
         }
         plaintext_len = len;
 
-        if (1 != EVP_DecryptFinal_ex(ctx, plaintext + len, &len)) {
+        if (1 != EVP_DecryptFinal_ex(ctx, plaintext.data() + len, &len)) {
             cerr << "结束解密操作时出错" << endl;
             EVP_CIPHER_CTX_free(ctx);
             return "";
@@ -171,9 +180,10 @@ public:
         plaintext_len += len;
 
         EVP_CIPHER_CTX_free(ctx);
-        return string(reinterpret_cast<char*>(plaintext), plaintext_len);
+        return string(reinterpret_cast<char*>(plaintext.data()), plaintext_len);
     }
 };
+
 
 // 任务结构体，包含任务执行函数和估计的执行时间
 struct Task {
@@ -335,7 +345,7 @@ void monitor(ThreadPool& pool, Logger& logger, std::atomic<bool>& stop_monitor) 
 //}
 
 int main() {
-    Logger logger("log.txt");
+    Logger logger("log15.txt");
     ThreadPool pool(4, &logger);
     Encryptor encryptor("66123456789123456789123456789123");
     std::atomic<bool> stop_monitor(false);
@@ -343,47 +353,68 @@ int main() {
     // 启动监控线程
     std::thread monitor_thread(monitor, std::ref(pool), std::ref(logger), std::ref(stop_monitor));
 
-    for (int i = 0; i < 10; ++i) {
+    const int totalSize = 50 * 1024; // 50KB
+    const int numTasks = 10;
+    int taskSizes[numTasks] = { 0 };
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(1, totalSize / numTasks); // 每个任务的大小上限
+
+    // 随机分配大小
+    for (int i = 0; i < numTasks; ++i) {
+        taskSizes[i] = dis(gen);
+    }
+
+    // 确保总大小不超过50KB
+    int totalAllocated = 0;
+    for (int i = 0; i < numTasks; ++i) {
+        totalAllocated += taskSizes[i];
+    }
+
+    // 调整最后一个任务的大小以确保总大小为50KB
+    taskSizes[numTasks - 1] += (totalSize - totalAllocated);
+
+    for (int i = 0; i < numTasks; ++i) {
         Task task;
-        task.function = [i, &encryptor, &logger] {
+        task.function = [i, size = taskSizes[i], &encryptor, &logger] {
             try {
                 std::stringstream ss;
-                ss << "任务 " << i << " 的数据";
-                std::string plaintext = ss.str();
+                ss << "任务 " << i << " 的数据 (" << size << " 字节)";
+                std::string plaintext(size, 'a'); // 创建指定大小的任务数据
 
-                std::lock_guard<std::mutex> encryptor_lock(encryptor_mutex); // 加锁以确保线程安全
+                std::lock_guard<std::mutex> encryptor_lock(encryptor_mutex);
                 std::string encrypted_data = encryptor.encrypt(plaintext);
 
                 {
-                    std::lock_guard<std::mutex> logger_lock(logger_mutex); // 加锁以确保线程安全
+                    std::lock_guard<std::mutex> logger_lock(logger_mutex);
+                    logger.log("任务 " + std::to_string(i) + " 执行中...");
                     logger.log("加密后的数据：" + encrypted_data);
                 }
 
                 std::string decrypted_data = encryptor.decrypt(encrypted_data);
 
                 {
-                    std::lock_guard<std::mutex> logger_lock(logger_mutex); // 加锁以确保线程安全
+                    std::lock_guard<std::mutex> logger_lock(logger_mutex);
                     logger.log("解密后的数据：" + decrypted_data);
+                    logger.log("任务 " + std::to_string(i) + " 执行完成");
                 }
             }
             catch (const std::exception& e) {
-                std::lock_guard<std::mutex> logger_lock(logger_mutex); // 加锁以确保线程安全
+                std::lock_guard<std::mutex> logger_lock(logger_mutex);
                 logger.log("处理任务 " + std::to_string(i) + " 时发生错误：" + e.what());
             }
             };
-        task.estimated_execution_time = 1;
+        task.estimated_execution_time = 1; // 根据需要估算
         pool.enqueue(task);
     }
 
     // 动态调整线程池大小
     std::this_thread::sleep_for(std::chrono::seconds(1));
-    pool.resize(6); // 可以在这里增加逻辑来根据任务情况决定是否减少线程数
+    pool.resize(6);
 
     // 停止监控
     stop_monitor = true;
     monitor_thread.join();
-
-  
 
     return 0;
 }
