@@ -1,3 +1,6 @@
+#pragma comment(lib,"libssl.lib")
+#pragma comment(lib,"libcrypto.lib")
+
 #include <iostream>
 #include <thread>
 #include <functional>
@@ -16,10 +19,53 @@
 #include <fstream>
 #include <chrono>
 #include <random>
+#include <unordered_map>
 
 using namespace std;
 mutex logger_mutex; // 用于保护 Logger 的访问
 mutex encryptor_mutex; // 用于保护 Encryptor 的访问
+
+// 选举类
+class Election {
+public:
+    Election(int numNodes) : numNodes(numNodes), leader(-1), currentNode(0) {
+        nodes.resize(numNodes);
+        for (int i = 0; i < numNodes; ++i) {
+            nodes[i] = i; // 节点ID
+        }
+    }
+
+    void startElection(int initiator) {
+        std::lock_guard<std::mutex> lock(electionMutex);
+        std::cout << "节点 " << initiator << " 发起选举\n";
+        int candidate = initiator;
+
+        // 在环中传递候选者
+        for (int i = 0; i < numNodes; ++i) {
+            int nextNode = (initiator + 1) % numNodes;
+            if (nextNode == candidate) break; // 如果返回到原始候选者则停止
+            std::cout << "节点 " << initiator << " 传递候选者 " << candidate << " 到节点 " << nextNode << "\n";
+            initiator = nextNode;
+        }
+
+        // 选举结果
+        leader = candidate;
+        std::cout << "节点 " << leader << " 被选为领导者\n";
+    }
+
+    int getLeader() const {
+        return leader;
+    }
+
+private:
+    std::vector<int> nodes; // 节点ID
+    int numNodes; // 节点数量
+    std::atomic<int> leader; // 领导者ID
+    std::atomic<int> currentNode; // 当前节点ID
+    std::mutex electionMutex; // 保护选举过程的互斥锁
+};
+
+
 
 // 日志记录类
 class Logger {
@@ -345,13 +391,20 @@ void monitor(ThreadPool& pool, Logger& logger, std::atomic<bool>& stop_monitor) 
 //}
 
 int main() {
-    Logger logger("log15.txt");
+    Logger logger("log19.txt");
     ThreadPool pool(4, &logger);
     Encryptor encryptor("66123456789123456789123456789123");
     std::atomic<bool> stop_monitor(false);
 
     // 启动监控线程
     std::thread monitor_thread(monitor, std::ref(pool), std::ref(logger), std::ref(stop_monitor));
+
+    // 添加选举过程
+    Election election(4); // 假设有4个节点
+    std::thread election_thread([&election]() {
+        std::this_thread::sleep_for(std::chrono::seconds(2)); // 模拟延迟
+        election.startElection(0); // 节点0发起选举
+        });
 
     const int totalSize = 50 * 1024; // 50KB
     const int numTasks = 10;
@@ -415,6 +468,7 @@ int main() {
     // 停止监控
     stop_monitor = true;
     monitor_thread.join();
+    election_thread.join(); // 等待选举线程结束
 
     return 0;
 }
